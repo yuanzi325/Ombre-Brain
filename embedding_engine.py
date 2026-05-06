@@ -39,13 +39,23 @@ class EmbeddingEngine:
             or "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         self.model = embed_cfg.get("model", "gemini-embedding-001")
-        self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
+
+        # enabled flag: respects OMBRE_EMBEDDING_ENABLED env var (via config) AND api_key
+        enabled_flag = embed_cfg.get("enabled", True)
+        self.enabled = enabled_flag and bool(self.api_key)
+
+        if not enabled_flag:
+            logger.info("EmbeddingEngine: disabled by config (OMBRE_EMBEDDING_ENABLED=false)")
+        elif not self.api_key:
+            logger.info("EmbeddingEngine: disabled (no API key configured)")
+        else:
+            logger.info(f"EmbeddingEngine: enabled, model={self.model}")
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
 
-        # --- Initialize client ---
+        # --- Initialize client only when enabled ---
         if self.enabled:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
@@ -55,7 +65,7 @@ class EmbeddingEngine:
         else:
             self.client = None
 
-        # --- Initialize SQLite ---
+        # --- Initialize SQLite (always, for schema consistency) ---
         self._init_db()
 
     def _init_db(self):
@@ -75,10 +85,11 @@ class EmbeddingEngine:
     async def generate_and_store(self, bucket_id: str, content: str) -> bool:
         """
         Generate embedding for content and store in SQLite.
-        为内容生成 embedding 并存入 SQLite。
-        Returns True on success, False on failure.
+        Returns True on success, False if disabled or on failure.
         """
-        if not self.enabled or not content or not content.strip():
+        if not self.enabled:
+            return False  # disabled: silently skip, never block main flow
+        if not content or not content.strip():
             return False
 
         try:
@@ -142,11 +153,10 @@ class EmbeddingEngine:
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
         """
         Search for buckets similar to query text.
-        Returns list of (bucket_id, similarity_score) sorted by score desc.
-        搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
+        Returns [] when disabled or on failure — never blocks main search flow.
         """
         if not self.enabled:
-            return []
+            return []  # disabled: main fuzzy search handles everything
 
         try:
             query_embedding = await self._generate_embedding(query)

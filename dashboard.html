@@ -1643,7 +1643,7 @@ async function loadImportResults() {
   const container = document.getElementById('import-results-list');
   container.innerHTML = '<div class="loading">加载中…</div>';
   try {
-    const res = await fetch(BASE + '/api/import/results?limit=30');
+    const res = await fetch(BASE + '/api/import/results?limit=30&profile=' + encodeURIComponent(currentImportProfile));
     const data = await res.json();
     if (!data.buckets || !data.buckets.length) {
       container.innerHTML = '<p style="color:var(--text-dim)">暂无记忆桶</p>';

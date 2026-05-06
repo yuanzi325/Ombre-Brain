@@ -1871,7 +1871,10 @@ async def api_import_results(request):
     if err: return err
     try:
         limit = int(request.query_params.get("limit", "50"))
+        profile = request.query_params.get("profile", "")
         all_buckets = await bucket_mgr.list_all(include_archive=False)
+        if profile:
+            all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
         # Sort by created time, newest first
         all_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
         results = []

@@ -323,8 +323,10 @@ async def health_check(request):
 @mcp.custom_route("/breath-hook", methods=["GET"])
 async def breath_hook(request):
     from starlette.responses import PlainTextResponse
+    profile = request.query_params.get("profile", "")
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
+        all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
         # pinned
         pinned = [b for b in all_buckets if b["metadata"].get("pinned") or b["metadata"].get("protected")]
         # top 2 unresolved by score
@@ -380,8 +382,10 @@ async def breath_hook(request):
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
+    profile = request.query_params.get("profile", "")
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
+        all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
         candidates = [
             b for b in all_buckets
             if b["metadata"].get("type") not in ("permanent", "feel")
@@ -426,47 +430,52 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    profile: str = "",
+    profiles: list[str] = None,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
     Returns (bucket_id_or_name, is_merged).
-    检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    profile filters merge candidates; profiles sets ownership of new buckets.
     """
     try:
-        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        existing = await bucket_mgr.search(
+            content, limit=1, domain_filter=domain or None, profile=profile
+        )
     except Exception as e:
-        logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+        logger.warning(f"Search for merge failed, creating new: {e}")
         existing = []
 
     if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
         bucket = existing[0]
-        # --- Never merge into pinned/protected buckets ---
-        # --- 不合并到钉选/保护桶 ---
+        # Never merge into pinned/protected buckets
         if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-            try:
-                merged = await dehydrator.merge(bucket["content"], content)
-                old_v = bucket["metadata"].get("valence", 0.5)
-                old_a = bucket["metadata"].get("arousal", 0.3)
-                merged_valence = round((old_v + valence) / 2, 2)
-                merged_arousal = round((old_a + arousal) / 2, 2)
-                await bucket_mgr.update(
-                    bucket["id"],
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                )
-                # --- Update embedding after merge ---
+            # Only merge if profiles are compatible (no cross-profile merging)
+            src_profiles = set(bucket["metadata"].get("profiles") or ["shared"])
+            tgt_profiles = set(profiles or ["shared"])
+            if src_profiles & tgt_profiles:  # must share at least one profile
                 try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception:
-                    pass
-                return bucket["metadata"].get("name", bucket["id"]), True
-            except Exception as e:
-                logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
+                    merged = await dehydrator.merge(bucket["content"], content)
+                    old_v = bucket["metadata"].get("valence", 0.5)
+                    old_a = bucket["metadata"].get("arousal", 0.3)
+                    merged_valence = round((old_v + valence) / 2, 2)
+                    merged_arousal = round((old_a + arousal) / 2, 2)
+                    await bucket_mgr.update(
+                        bucket["id"],
+                        content=merged,
+                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
+                        importance=max(bucket["metadata"].get("importance", 5), importance),
+                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
+                        valence=merged_valence,
+                        arousal=merged_arousal,
+                    )
+                    try:
+                        await embedding_engine.generate_and_store(bucket["id"], merged)
+                    except Exception:
+                        pass
+                    return bucket["metadata"].get("name", bucket["id"]), True
+                except Exception as e:
+                    logger.warning(f"Merge failed, creating new: {e}")
 
     bucket_id = await bucket_mgr.create(
         content=content,
@@ -476,8 +485,8 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        profiles=profiles or ["shared"],
     )
-    # --- Generate embedding for new bucket ---
     try:
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
@@ -503,8 +512,9 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     importance_min: int = -1,
+    profile: str = "",
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。importance_min>=1时按重要度批量拉取。profile=cc/cx/空,空=只看shared。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -516,6 +526,7 @@ async def breath(
             all_buckets = await bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             return f"记忆系统暂时无法访问: {e}"
+        all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
         filtered = [
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
@@ -552,8 +563,10 @@ async def breath(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
+        # Apply profile filter to the full list
+        all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
+
         # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
@@ -659,6 +672,7 @@ async def breath(
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
@@ -688,9 +702,10 @@ async def breath(
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            profile=profile,
         )
     except Exception as e:
-        logger.error(f"Search failed / 检索失败: {e}")
+        logger.error(f"Search failed: {e}")
         return "检索过程出错，请稍后重试。"
 
     # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
@@ -706,12 +721,13 @@ async def breath(
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
                 if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                    bucket["score"] = round(sim_score * 100, 2)
-                    bucket["vector_match"] = True
-                    matches.append(bucket)
-                    matched_ids.add(bucket_id)
+                    if bucket_mgr._visible_for_profile(bucket, profile):
+                        bucket["score"] = round(sim_score * 100, 2)
+                        bucket["vector_match"] = True
+                        matches.append(bucket)
+                        matched_ids.add(bucket_id)
     except Exception as e:
-        logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+        logger.warning(f"Vector search failed, using keyword only: {e}")
 
     results = []
     token_used = 0
@@ -746,6 +762,7 @@ async def breath(
     if len(matches) < 3 and random.random() < 0.4:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
             matched_ids = {b["id"] for b in matches}
             low_weight = [
                 b for b in all_buckets
@@ -776,6 +793,15 @@ async def breath(
 # Tool 2: hold — Hold on to this
 # 工具 2：hold — 握住，留下来
 # =============================================================
+def _parse_profiles(profiles: str = "", profile: str = "", feel: bool = False) -> list[str]:
+    """Parse profiles/profile params into a profiles list."""
+    if profiles and profiles.strip():
+        return [p.strip() for p in profiles.split(",") if p.strip()]
+    if feel and profile and profile.strip():
+        return [profile.strip()]
+    return ["shared"]
+
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -783,10 +809,13 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
-    source_bucket: str = "",    valence: float = -1,
+    source_bucket: str = "",
+    valence: float = -1,
     arousal: float = -1,
+    profile: str = "",
+    profiles: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID。profile=cc/cx读取视角,profiles=cc,cx逗号分隔指定写入归属。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -795,11 +824,10 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+    resolved_profiles = _parse_profiles(profiles, profile, feel)
 
-    # --- Feel mode: store as feel type, minimal metadata ---
-    # --- Feel 模式：存为 feel 类型，最少元数据 ---
+    # --- Feel mode ---
     if feel:
-        # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
         bucket_id = await bucket_mgr.create(
@@ -811,6 +839,7 @@ async def hold(
             arousal=feel_arousal,
             name=None,
             bucket_type="feel",
+            profiles=resolved_profiles,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -864,6 +893,7 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            profiles=resolved_profiles,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -871,7 +901,7 @@ async def hold(
             pass
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
-    # --- Step 2: merge or create / 合并或新建 ---
+    # --- Step 2: merge or create ---
     result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
@@ -880,6 +910,8 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        profile=profile,
+        profiles=resolved_profiles,
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -891,8 +923,8 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
+async def grow(content: str, profile: str = "", profiles: str = "") -> str:
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。profile=cc/cx读取视角,profiles=cc,cx逗号分隔指定写入归属。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -903,12 +935,14 @@ async def grow(content: str) -> str:
     # For very short inputs (like "1"), calling digest is wasteful:
     # it sends the full DIGEST_PROMPT (~800 tokens) to DeepSeek for nothing.
     # Instead, run analyze + create directly.
+    resolved_profiles = _parse_profiles(profiles, profile)
+
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         try:
             analysis = await dehydrator.analyze(content)
         except Exception as e:
-            logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
+            logger.warning(f"Fast-path analyze failed: {e}")
             analysis = {
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
@@ -921,6 +955,8 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            profile=profile,
+            profiles=resolved_profiles,
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -951,6 +987,8 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                profile=profile,
+                profiles=resolved_profiles,
             )
 
             if is_merged:
@@ -989,8 +1027,9 @@ async def trace(
     digested: int = -1,
     content: str = "",
     delete: bool = False,
+    profiles: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除,profiles=cc,cx逗号分隔修改归属。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1030,6 +1069,8 @@ async def trace(
         updates["digested"] = bool(digested)
     if content:
         updates["content"] = content
+    if profiles:
+        updates["profiles"] = [p.strip() for p in profiles.split(",") if p.strip()]
 
     if not updates:
         return "没有任何字段需要修改。"
@@ -1068,8 +1109,8 @@ async def trace(
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+async def pulse(include_archive: bool = False, profile: str = "") -> str:
+    """系统状态+记忆桶列表。include_archive=True含归档。profile=cc/cx/空过滤可见桶。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -1087,6 +1128,7 @@ async def pulse(include_archive: bool = False) -> str:
     # --- List all bucket summaries / 列出所有桶摘要 ---
     try:
         buckets = await bucket_mgr.list_all(include_archive=include_archive)
+        buckets = bucket_mgr.filter_by_profile(buckets, profile)
     except Exception as e:
         return status + f"\n列出记忆桶失败: {e}"
 
@@ -1139,8 +1181,8 @@ async def pulse(include_archive: bool = False) -> str:
 # Claude then decides: resolve some, write feels, or do nothing.
 # =============================================================
 @mcp.tool()
-async def dream() -> str:
-    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
+async def dream(profile: str = "") -> str:
+    """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。profile=cc/cx/空过滤可见桶。"""
     await decay_engine.ensure_started()
 
     try:
@@ -1149,7 +1191,9 @@ async def dream() -> str:
         logger.error(f"Dream failed to list buckets: {e}")
         return "记忆系统暂时无法访问。"
 
-    # --- Filter: recent surface-level dynamic buckets (not permanent/pinned/feel) ---
+    # Apply profile filter
+    all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
+
     candidates = [
         b for b in all_buckets
         if b["metadata"].get("type") not in ("permanent", "feel")
@@ -1269,8 +1313,11 @@ async def api_buckets(request):
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
+    profile = request.query_params.get("profile", "")
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=True)
+        if profile:
+            all_buckets = bucket_mgr.filter_by_profile(all_buckets, profile)
         result = []
         for b in all_buckets:
             meta = b.get("metadata", {})
@@ -1325,10 +1372,11 @@ async def api_search(request):
     err = _require_auth(request)
     if err: return err
     query = request.query_params.get("q", "")
+    profile = request.query_params.get("profile", "")
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        matches = await bucket_mgr.search(query, limit=10, profile=profile)
         result = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -1671,6 +1719,11 @@ async def api_host_vault_get(request):
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
+    if config.get("storage", {}).get("backend") == "supabase":
+        return JSONResponse({
+            "value": "",
+            "note": "storage backend is supabase; host vault is disabled",
+        })
     value = _read_env_var("OMBRE_HOST_VAULT_DIR")
     return JSONResponse({
         "value": value,
@@ -1681,14 +1734,12 @@ async def api_host_vault_get(request):
 
 @mcp.custom_route("/api/host-vault", methods=["POST"])
 async def api_host_vault_set(request):
-    """
-    Persist OMBRE_HOST_VAULT_DIR to the project .env file.
-    Body: {"value": "/path/to/vault"}  (empty string clears the entry)
-    Note: container restart is required for docker-compose to pick up the new mount.
-    """
+    """Persist OMBRE_HOST_VAULT_DIR to the project .env file."""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err: return err
+    if config.get("storage", {}).get("backend") == "supabase":
+        return JSONResponse({"error": "storage backend is supabase; host vault is disabled"}, status_code=400)
     try:
         body = await request.json()
     except Exception:
@@ -1866,9 +1917,7 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                await bucket_mgr.delete(bid)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")

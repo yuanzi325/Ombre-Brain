@@ -178,6 +178,7 @@ class BucketManager:
             "tags": metadata.get("tags") or [],
             "domain": metadata.get("domain") or [],
             "bucket_type": metadata.get("type") or "dynamic",
+            "importance": max(1, min(10, int(metadata.get("importance", 5)))),
             "valence": max(0.0, min(1.0, float(metadata.get("valence", 0.5)))),
             "arousal": max(0.0, min(1.0, float(metadata.get("arousal", 0.3)))),
             "activation_count": metadata.get("activation_count", 0),
@@ -424,12 +425,12 @@ class BucketManager:
         if "pinned" in kwargs:
             updates["pinned"] = bool(kwargs["pinned"])
             if kwargs["pinned"]:
-                updates["importance"] = 10
+                updates["importance"] = 10  # pinned → lock importance column to 10
                 updates["bucket_type"] = "permanent"
         if "protected" in kwargs:
             updates["protected"] = bool(kwargs["protected"])
             if kwargs["protected"]:
-                updates["importance"] = 10
+                updates["importance"] = 10  # protected → lock importance column to 10
         if "digested" in kwargs:
             updates["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
@@ -443,8 +444,7 @@ class BucketManager:
         if "arousal" in kwargs:
             updates["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
         if "importance" in kwargs and not is_pinned:
-            # importance stored in ombre_metadata; also set column if it exists
-            pass  # handled via raw below
+            updates["importance"] = max(1, min(10, int(kwargs["importance"])))
 
         updates["last_active"] = now_iso()
         updates["updated_at"] = now_iso()

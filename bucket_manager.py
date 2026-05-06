@@ -3,26 +3,9 @@
 # 模块：记忆桶管理器
 #
 # CRUD operations, multi-dimensional index search, activation updates
-# for memory buckets.
-# 记忆桶的增删改查、多维索引搜索、激活更新。
-#
-# Core design:
-# 核心逻辑：
-#   - Each bucket = one Markdown file (YAML frontmatter + body)
-#     每个记忆桶 = 一个 Markdown 文件
-#   - Storage by type: permanent / dynamic / archive
-#     存储按类型分目录
-#   - Multi-dimensional soft index: domain + valence/arousal + fuzzy text
-#     多维软索引：主题域 + 情感坐标 + 文本模糊匹配
-#   - Search strategy: domain pre-filter → weighted multi-dim ranking
-#     搜索策略：主题域预筛 → 多维加权精排
-#   - Emotion coordinates based on Russell circumplex model:
-#     情感坐标基于环形情感模型（Russell circumplex）：
-#       valence (0~1): 0=negative → 1=positive
-#       arousal (0~1): 0=calm → 1=excited
+# for memory buckets. Supports file backend (default) and Supabase backend.
 #
 # Depended on by: server.py, decay_engine.py
-# 被谁依赖：server.py, decay_engine.py
 # ============================================================
 
 import os
@@ -42,17 +25,8 @@ logger = logging.getLogger("ombre_brain.bucket")
 
 
 class BucketManager:
-    """
-    Memory bucket manager — entry point for all bucket CRUD operations.
-    Buckets are stored as Markdown files with YAML frontmatter for metadata
-    and body for content. Natively compatible with Obsidian browsing/editing.
-    记忆桶管理器 —— 所有桶的 CRUD 操作入口。
-    桶以 Markdown 文件存储，YAML frontmatter 存元数据，正文存内容。
-    天然兼容 Obsidian 直接浏览和编辑。
-    """
-
     def __init__(self, config: dict, embedding_engine=None):
-        # --- Read storage paths from config / 从配置中读取存储路径 ---
+        # --- Storage paths (file backend) ---
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
@@ -61,7 +35,19 @@ class BucketManager:
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
-        # --- Wikilink config / 双链配置 ---
+        # --- Supabase backend ---
+        self.storage_backend = config.get("storage", {}).get("backend", "file")
+        self.use_supabase = self.storage_backend == "supabase"
+
+        if self.use_supabase:
+            from supabase import create_client
+            url = config["supabase"]["url"]
+            key = config["supabase"]["key"]
+            self.supabase = create_client(url, key)
+            self.memory_table = config.get("supabase", {}).get("memory_table", "memories")
+            logger.info(f"BucketManager: Supabase backend, table={self.memory_table}")
+
+        # --- Wikilink config ---
         wikilink_cfg = config.get("wikilink", {})
         self.wikilink_enabled = wikilink_cfg.get("enabled", True)
         self.wikilink_use_tags = wikilink_cfg.get("use_tags", False)
@@ -81,23 +67,135 @@ class BucketManager:
         }
         self.wikilink_stopwords |= {w.lower() for w in self.wikilink_exclude_keywords}
 
-        # --- Search scoring weights / 检索权重配置 ---
+        # --- Search scoring weights ---
         scoring = config.get("scoring_weights", {})
         self.w_topic = scoring.get("topic_relevance", 4.0)
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
         self.w_time = scoring.get("time_proximity", 1.5)
         self.w_importance = scoring.get("importance", 1.0)
-        self.content_weight = scoring.get("content_weight", 1.0)  # body×1, per spec
+        self.content_weight = scoring.get("content_weight", 1.0)
 
-        # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
 
-    # ---------------------------------------------------------
-    # Create a new bucket
-    # 创建新桶
-    # Write content and metadata into a .md file
-    # 将内容和元数据写入一个 .md 文件
-    # ---------------------------------------------------------
+    # =========================================================
+    # Profile helpers
+    # =========================================================
+
+    @staticmethod
+    def _visible_for_profile(bucket: dict, profile: str = "") -> bool:
+        """
+        No profile → only "shared" buckets visible.
+        profile="cc" → "shared" + "cc" visible.
+        profile="cx" → "shared" + "cx" visible.
+        """
+        profiles = bucket.get("metadata", {}).get("profiles") or ["shared"]
+        if not profile:
+            return "shared" in profiles
+        return "shared" in profiles or profile in profiles
+
+    @staticmethod
+    def filter_by_profile(buckets: list, profile: str = "") -> list:
+        return [b for b in buckets if BucketManager._visible_for_profile(b, profile)]
+
+    # =========================================================
+    # Supabase row ↔ bucket conversion
+    # =========================================================
+
+    def _row_to_bucket(self, row: dict) -> dict:
+        """Convert a public.memories row to Ombre bucket structure."""
+        raw = row.get("raw") or {}
+        ombre_meta = raw.get("ombre_metadata") or {}
+
+        bucket_id = row.get("bucket_id") or str(row.get("id", ""))
+
+        # importance: column first, then ombre_metadata, default 5
+        importance = row.get("importance")
+        if importance is None:
+            importance = ombre_meta.get("importance", 5)
+        try:
+            importance = max(1, min(10, int(importance)))
+        except (TypeError, ValueError):
+            importance = 5
+
+        created = str(row.get("created_at") or row.get("date") or "")
+        last_active = (
+            str(row.get("last_active") or "")
+            or str(row.get("updated_at") or "")
+            or created
+        )
+
+        activation_count = row.get("activation_count")
+        if activation_count is None:
+            activation_count = ombre_meta.get("activation_count", 0)
+        try:
+            activation_count = float(activation_count)
+        except (TypeError, ValueError):
+            activation_count = 0.0
+
+        return {
+            "id": bucket_id,
+            "metadata": {
+                "id": bucket_id,
+                "name": row.get("name") or row.get("title") or bucket_id,
+                "tags": row.get("tags") or row.get("keywords") or [],
+                "domain": row.get("domain") or [],
+                "valence": float(row.get("valence") if row.get("valence") is not None else 0.5),
+                "arousal": float(row.get("arousal") if row.get("arousal") is not None else 0.3),
+                "importance": importance,
+                "type": row.get("bucket_type") or "dynamic",
+                "created": created,
+                "last_active": last_active,
+                "activation_count": activation_count,
+                "resolved": bool(row.get("resolved")),
+                "pinned": bool(row.get("pinned")),
+                "protected": bool(row.get("protected")),
+                "digested": bool(row.get("digested")),
+                "model_valence": row.get("model_valence"),
+                "profiles": row.get("profiles") or ["shared"],
+            },
+            "content": row.get("content") or "",
+            "path": "",
+            "row": row,
+        }
+
+    def _metadata_to_row(self, metadata: dict, content: str, existing_raw: dict = None) -> dict:
+        """Convert Ombre metadata + content to a public.memories row dict.
+        Only includes columns guaranteed by migration SQL + standard columns.
+        importance/keywords stored in raw.ombre_metadata (not as direct columns).
+        """
+        raw = dict(existing_raw or {})
+        # Store full metadata snapshot + extra fields not in schema columns
+        raw["ombre_metadata"] = {
+            **metadata,
+            "importance": metadata.get("importance", 5),
+        }
+
+        return {
+            "bucket_id": metadata.get("id") or metadata.get("bucket_id"),
+            "name": metadata.get("name"),
+            "title": metadata.get("name"),
+            "content": content,
+            "tags": metadata.get("tags") or [],
+            "domain": metadata.get("domain") or [],
+            "bucket_type": metadata.get("type") or "dynamic",
+            "valence": max(0.0, min(1.0, float(metadata.get("valence", 0.5)))),
+            "arousal": max(0.0, min(1.0, float(metadata.get("arousal", 0.3)))),
+            "activation_count": metadata.get("activation_count", 0),
+            "last_active": metadata.get("last_active") or now_iso(),
+            "resolved": bool(metadata.get("resolved", False)),
+            "pinned": bool(metadata.get("pinned", False)),
+            "protected": bool(metadata.get("protected", False)),
+            "digested": bool(metadata.get("digested", False)),
+            "model_valence": metadata.get("model_valence"),
+            "profiles": metadata.get("profiles") or ["shared"],
+            "raw": raw,
+            "updated_at": now_iso(),
+        }
+
+    # =========================================================
+    # Create
+    # =========================================================
+
     async def create(
         self,
         content: str,
@@ -110,31 +208,21 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        profiles: list[str] = None,
     ) -> str:
-        """
-        Create a new memory bucket, return bucket ID.
-        创建一个新的记忆桶，返回桶 ID。
-
-        pinned/protected=True: bucket won't be merged, decayed, or have importance changed.
-        Importance is locked to 10 for pinned/protected buckets.
-        pinned/protected 桶不参与合并与衰减，importance 强制锁定为 10。
-        """
+        """Create a new memory bucket, return bucket ID."""
         bucket_id = generate_bucket_id()
         bucket_name = sanitize_name(name) if name else bucket_id
-        # feel buckets are allowed to have empty domain; others default to ["未分类"]
+
         if bucket_type == "feel":
             domain = domain if domain is not None else []
         else:
             domain = domain or ["未分类"]
         tags = tags or []
-        linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
 
-        # --- Pinned/protected buckets: lock importance to 10 ---
-        # --- 钉选/保护桶：importance 强制锁定为 10 ---
         if pinned or protected:
             importance = 10
 
-        # --- Build YAML frontmatter metadata / 构建元数据 ---
         metadata = {
             "id": bucket_id,
             "name": bucket_name,
@@ -147,35 +235,44 @@ class BucketManager:
             "created": now_iso(),
             "last_active": now_iso(),
             "activation_count": 0,
+            "profiles": profiles or ["shared"],
         }
         if pinned:
             metadata["pinned"] = True
+            if bucket_type != "permanent":
+                metadata["type"] = "permanent"
         if protected:
             metadata["protected"] = True
 
-        # --- Assemble Markdown file (frontmatter + body) ---
-        # --- 组装 Markdown 文件 ---
-        post = frontmatter.Post(linked_content, **metadata)
+        if self.use_supabase:
+            row = self._metadata_to_row(metadata, content)
+            row["created_at"] = metadata["created"]
+            try:
+                self.supabase.table(self.memory_table).insert(row).execute()
+            except Exception as e:
+                logger.error(f"Supabase insert failed for {bucket_id}: {e}")
+                raise
+            logger.info(f"Created bucket (supabase): {bucket_id} ({bucket_name})")
+            return bucket_id
 
-        # --- Choose directory by type + primary domain ---
-        # --- 按类型 + 主题域选择存储目录 ---
+        # --- File backend ---
+        post = frontmatter.Post(content, **metadata)
+
         if bucket_type == "permanent" or pinned:
             type_dir = self.permanent_dir
-            if pinned and bucket_type != "permanent":
-                metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
         else:
             type_dir = self.dynamic_dir
+
         if bucket_type == "feel":
-            primary_domain = "沉淀物"  # feel subfolder name
+            primary_domain = "沉淀物"
         else:
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+
         target_dir = os.path.join(type_dir, primary_domain)
         os.makedirs(target_dir, exist_ok=True)
 
-        # --- Filename: readable_name_bucketID.md (Obsidian friendly) ---
-        # --- 文件名：可读名称_桶ID.md ---
         if bucket_name and bucket_name != bucket_id:
             filename = f"{bucket_name}_{bucket_id}.md"
         else:
@@ -186,61 +283,60 @@ class BucketManager:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
         except OSError as e:
-            logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
+            logger.error(f"Failed to write bucket file: {file_path}: {e}")
             raise
 
         logger.info(
-            f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
+            f"Created bucket: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
         return bucket_id
 
-    # ---------------------------------------------------------
-    # Read bucket content
-    # 读取桶内容
-    # Returns {"id", "metadata", "content", "path"} or None
-    # ---------------------------------------------------------
+    # =========================================================
+    # Get
+    # =========================================================
+
     async def get(self, bucket_id: str) -> Optional[dict]:
-        """
-        Read a single bucket by ID.
-        根据 ID 读取单个桶。
-        """
+        """Read a single bucket by ID."""
         if not bucket_id or not isinstance(bucket_id, str):
             return None
+
+        if self.use_supabase:
+            try:
+                result = self.supabase.table(self.memory_table).select("*").eq("bucket_id", bucket_id).execute()
+                if result.data:
+                    row = result.data[0]
+                    if (row.get("raw") or {}).get("ombre_deleted"):
+                        return None
+                    return self._row_to_bucket(row)
+                # Fallback: bucket_id might be a UUID
+                if len(bucket_id) in (32, 36):
+                    result2 = self.supabase.table(self.memory_table).select("*").filter("id", "eq", bucket_id).execute()
+                    if result2.data:
+                        row = result2.data[0]
+                        if (row.get("raw") or {}).get("ombre_deleted"):
+                            return None
+                        return self._row_to_bucket(row)
+                return None
+            except Exception as e:
+                logger.warning(f"Supabase get failed for {bucket_id}: {e}")
+                return None
+
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return None
         return self._load_bucket(file_path)
 
-    # ---------------------------------------------------------
-    # Move bucket between directories
-    # 在目录间移动桶文件
-    # ---------------------------------------------------------
-    def _move_bucket(self, file_path: str, target_type_dir: str, domain: list[str] = None) -> str:
-        """
-        Move a bucket file to a new type directory, preserving domain subfolder.
-        Returns new file path.
-        """
-        primary_domain = sanitize_name(domain[0]) if domain else "未分类"
-        target_dir = os.path.join(target_type_dir, primary_domain)
-        os.makedirs(target_dir, exist_ok=True)
-        filename = os.path.basename(file_path)
-        new_path = safe_path(target_dir, filename)
-        if os.path.normpath(file_path) != os.path.normpath(new_path):
-            os.rename(file_path, new_path)
-            logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
-        return new_path
+    # =========================================================
+    # Update
+    # =========================================================
 
-    # ---------------------------------------------------------
-    # Update bucket
-    # 更新桶
-    # Supports: content, tags, importance, valence, arousal, name, resolved
-    # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
-        """
-        Update bucket content or metadata fields.
-        更新桶的内容或元数据字段。
-        """
+        """Update bucket content or metadata fields."""
+        if self.use_supabase:
+            return await self._update_supabase(bucket_id, **kwargs)
+
+        # --- File backend ---
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -248,18 +344,15 @@ class BucketManager:
         try:
             post = frontmatter.load(file_path)
         except Exception as e:
-            logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
+            logger.warning(f"Failed to load bucket for update: {file_path}: {e}")
             return False
 
-        # --- Pinned/protected buckets: lock importance to 10, ignore importance changes ---
-        # --- 钉选/保护桶：importance 不可修改，强制保持 10 ---
         is_pinned = post.get("pinned", False) or post.get("protected", False)
         if is_pinned:
-            kwargs.pop("importance", None)  # silently ignore importance update
+            kwargs.pop("importance", None)
 
-        # --- Update only fields that were passed in / 只改传入的字段 ---
         if "content" in kwargs:
-            post.content = kwargs["content"]  # wikilink injection disabled; LLM adds [[]] via prompt
+            post.content = kwargs["content"]
         if "tags" in kwargs:
             post["tags"] = kwargs["tags"]
         if "importance" in kwargs:
@@ -277,27 +370,23 @@ class BucketManager:
         if "pinned" in kwargs:
             post["pinned"] = bool(kwargs["pinned"])
             if kwargs["pinned"]:
-                post["importance"] = 10  # pinned → lock importance to 10
+                post["importance"] = 10
         if "digested" in kwargs:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "profiles" in kwargs:
+            post["profiles"] = kwargs["profiles"]
 
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()
 
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
         except OSError as e:
-            logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
+            logger.error(f"Failed to write bucket update: {file_path}: {e}")
             return False
 
-        # --- Auto-move: pinned → permanent/ ---
-        # --- 自动移动：钉选 → permanent/ ---
-        # NOTE: resolved buckets are NOT auto-archived here.
-        # They stay in dynamic/ and decay naturally until score < threshold.
-        # 注意：resolved 桶不在此自动归档，留在 dynamic/ 随衰减引擎自然归档。
         domain = post.get("domain", ["未分类"])
         if kwargs.get("pinned") and post.get("type") != "permanent":
             post["type"] = "permanent"
@@ -305,94 +394,188 @@ class BucketManager:
                 f.write(frontmatter.dumps(post))
             self._move_bucket(file_path, self.permanent_dir, domain)
 
-        logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        logger.info(f"Updated bucket: {bucket_id}")
         return True
 
-    # ---------------------------------------------------------
-    # Wikilink injection — DISABLED
-    # 自动添加 Obsidian 双链 — 已禁用
-    # Now handled by LLM prompts (Gemini adds [[]] for proper nouns)
-    # 现在由 LLM prompt 处理（Gemini 对人名/地名/专有名词加 [[]]）
-    # ---------------------------------------------------------
-    # def _apply_wikilinks(self, content, tags, domain, name): ...
-    # def _collect_wikilink_keywords(self, content, tags, domain, name): ...
-    # def _normalize_keywords(self, keywords): ...
-    # def _extract_auto_keywords(self, content): ...
+    async def _update_supabase(self, bucket_id: str, **kwargs) -> bool:
+        try:
+            result = self.supabase.table(self.memory_table).select("*").eq("bucket_id", bucket_id).execute()
+            if not result.data:
+                return False
+            row = result.data[0]
+        except Exception as e:
+            logger.warning(f"Supabase fetch for update failed {bucket_id}: {e}")
+            return False
 
-    # ---------------------------------------------------------
-    # Delete bucket
-    # 删除桶
-    # ---------------------------------------------------------
+        is_pinned = bool(row.get("pinned")) or bool(row.get("protected"))
+        updates: dict = {}
+
+        if "content" in kwargs:
+            updates["content"] = kwargs["content"]
+        if "tags" in kwargs:
+            updates["tags"] = kwargs["tags"]
+        if "domain" in kwargs:
+            updates["domain"] = kwargs["domain"]
+        if "name" in kwargs:
+            updates["name"] = sanitize_name(kwargs["name"])
+            updates["title"] = updates["name"]
+        if "resolved" in kwargs:
+            updates["resolved"] = bool(kwargs["resolved"])
+        if "pinned" in kwargs:
+            updates["pinned"] = bool(kwargs["pinned"])
+            if kwargs["pinned"]:
+                updates["importance"] = 10
+                updates["bucket_type"] = "permanent"
+        if "protected" in kwargs:
+            updates["protected"] = bool(kwargs["protected"])
+            if kwargs["protected"]:
+                updates["importance"] = 10
+        if "digested" in kwargs:
+            updates["digested"] = bool(kwargs["digested"])
+        if "model_valence" in kwargs:
+            updates["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "profiles" in kwargs:
+            updates["profiles"] = kwargs["profiles"]
+        if "activation_count" in kwargs:
+            updates["activation_count"] = kwargs["activation_count"]
+        if "valence" in kwargs:
+            updates["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
+        if "arousal" in kwargs:
+            updates["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
+        if "importance" in kwargs and not is_pinned:
+            # importance stored in ombre_metadata; also set column if it exists
+            pass  # handled via raw below
+
+        updates["last_active"] = now_iso()
+        updates["updated_at"] = now_iso()
+
+        # Update raw.ombre_metadata snapshot (surgical merge, preserve ombre_deleted etc.)
+        existing_raw = dict(row.get("raw") or {})
+        current_meta = dict(existing_raw.get("ombre_metadata") or {})
+        for key in ("name", "tags", "domain", "valence", "arousal", "importance",
+                    "resolved", "pinned", "protected", "digested", "model_valence",
+                    "profiles", "activation_count", "content"):
+            if key in kwargs:
+                current_meta[key] = kwargs[key]
+        existing_raw["ombre_metadata"] = current_meta
+        updates["raw"] = existing_raw
+
+        try:
+            self.supabase.table(self.memory_table).update(updates).eq("bucket_id", bucket_id).execute()
+        except Exception as e:
+            logger.error(f"Supabase update failed for {bucket_id}: {e}")
+            return False
+
+        logger.info(f"Updated bucket (supabase): {bucket_id}")
+        return True
+
+    # =========================================================
+    # Delete (supabase = soft delete)
+    # =========================================================
+
     async def delete(self, bucket_id: str) -> bool:
-        """
-        Delete a memory bucket file.
-        删除指定的记忆桶文件。
-        """
+        """Supabase: soft delete. File: hard delete."""
+        if self.use_supabase:
+            try:
+                result = self.supabase.table(self.memory_table).select("id, raw").eq("bucket_id", bucket_id).execute()
+                if not result.data:
+                    return False
+                existing_raw = dict(result.data[0].get("raw") or {})
+                existing_raw["ombre_deleted"] = True
+                self.supabase.table(self.memory_table).update({
+                    "raw": existing_raw,
+                    "resolved": True,
+                    "bucket_type": "archived",
+                    "updated_at": now_iso(),
+                }).eq("bucket_id", bucket_id).execute()
+                logger.info(f"Soft-deleted bucket (supabase): {bucket_id}")
+                if self.embedding_engine:
+                    try:
+                        self.embedding_engine.delete_embedding(bucket_id)
+                    except Exception:
+                        pass
+                return True
+            except Exception as e:
+                logger.error(f"Supabase delete failed for {bucket_id}: {e}")
+                return False
+
+        # --- File backend: hard delete ---
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
-
         try:
             os.remove(file_path)
         except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+            logger.error(f"Failed to delete bucket file: {file_path}: {e}")
             return False
-
-        logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
+        logger.info(f"Deleted bucket: {bucket_id}")
         return True
 
-    # ---------------------------------------------------------
-    # Touch bucket (refresh activation time + increment count)
-    # 触碰桶（刷新激活时间 + 累加激活次数）
-    # Called on every recall hit; affects decay score.
-    # 每次检索命中时调用，影响衰减得分。
-    # ---------------------------------------------------------
+    # =========================================================
+    # Touch
+    # =========================================================
+
     async def touch(self, bucket_id: str) -> None:
-        """
-        Update a bucket's last activation time and count.
-        Also triggers time ripple: nearby memories get a slight activation boost.
-        更新桶的最后激活时间和激活次数。
-        同时触发时间涟漪：时间上相邻的记忆轻微唤醒。
-        """
+        """Update activation time and count; trigger time ripple."""
+        if self.use_supabase:
+            try:
+                result = self.supabase.table(self.memory_table).select(
+                    "activation_count, created_at, last_active"
+                ).eq("bucket_id", bucket_id).execute()
+                if not result.data:
+                    return
+                row = result.data[0]
+                try:
+                    cur_count = float(row.get("activation_count") or 0)
+                except (TypeError, ValueError):
+                    cur_count = 0.0
+                new_now = now_iso()
+                self.supabase.table(self.memory_table).update({
+                    "activation_count": cur_count + 1,
+                    "last_active": new_now,
+                    "updated_at": new_now,
+                }).eq("bucket_id", bucket_id).execute()
+                ref_str = str(row.get("created_at") or row.get("last_active") or "")
+                try:
+                    ref_time = datetime.fromisoformat(ref_str) if ref_str else datetime.now()
+                except (ValueError, TypeError):
+                    ref_time = datetime.now()
+                await self._time_ripple(bucket_id, ref_time)
+            except Exception as e:
+                logger.warning(f"Supabase touch failed {bucket_id}: {e}")
+            return
+
+        # --- File backend ---
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return
-
         try:
             post = frontmatter.load(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
-
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
-
-            # --- Time ripple: boost nearby memories within ±48h ---
-            # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
+            current_time = datetime.fromisoformat(
+                str(post.get("created", post.get("last_active", "")))
+            )
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
-            logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+            logger.warning(f"Failed to touch bucket: {bucket_id}: {e}")
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
-        """
-        Slightly boost activation_count of buckets created/activated near the reference time.
-        轻微提升时间相邻桶的激活次数（+0.3），不改 last_active 避免递归唤醒。
-        Max 5 buckets rippled per touch to bound I/O.
-        """
+        """Boost activation_count (+0.3) of time-adjacent buckets. Max 5."""
         try:
             all_buckets = await self.list_all(include_archive=False)
         except Exception:
             return
 
         rippled = 0
-        max_ripple = 5
         for bucket in all_buckets:
-            if rippled >= max_ripple:
+            if rippled >= 5:
                 break
             if bucket["id"] == source_id:
                 continue
             meta = bucket.get("metadata", {})
-            # Skip pinned/permanent/feel
             if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
                 continue
 
@@ -403,39 +586,40 @@ class BucketManager:
             except (ValueError, TypeError):
                 continue
 
-            if delta_hours <= hours:
-                # Boost activation_count by 0.3 (fractional), don't change last_active
+            if delta_hours > hours:
+                continue
+
+            if self.use_supabase:
+                try:
+                    res = self.supabase.table(self.memory_table).select(
+                        "activation_count"
+                    ).eq("bucket_id", bucket["id"]).execute()
+                    if res.data:
+                        cur = float(res.data[0].get("activation_count") or 1)
+                        self.supabase.table(self.memory_table).update({
+                            "activation_count": round(cur + 0.3, 1)
+                        }).eq("bucket_id", bucket["id"]).execute()
+                        rippled += 1
+                except Exception:
+                    continue
+            else:
                 file_path = self._find_bucket_file(bucket["id"])
                 if not file_path:
                     continue
                 try:
                     post = frontmatter.load(file_path)
-                    current_count = post.get("activation_count", 1)
-                    # Store as float for fractional increments; calculate_score handles it
-                    post["activation_count"] = round(current_count + 0.3, 1)
+                    cur = post.get("activation_count", 1)
+                    post["activation_count"] = round(cur + 0.3, 1)
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(frontmatter.dumps(post))
                     rippled += 1
                 except Exception:
                     continue
 
-    # ---------------------------------------------------------
-    # Multi-dimensional search (core feature)
-    # 多维搜索（核心功能）
-    #
-    # Strategy: domain pre-filter → weighted multi-dim ranking
-    # 策略：主题域预筛 → 多维加权精排
-    #
-    # Ranking formula:
-    #   total = topic(×w_topic) + emotion(×w_emotion)
-    #           + time(×w_time) + importance(×w_importance)
-    #
-    # Per-dimension scores (normalized to 0~1):
-    #   topic     = rapidfuzz weighted match (name/tags/domain/body)
-    #   emotion   = 1 - Euclidean distance (query v/a vs bucket v/a)
-    #   time      = e^(-0.02 × days) (recent memories first)
-    #   importance = importance / 10
-    # ---------------------------------------------------------
+    # =========================================================
+    # Search
+    # =========================================================
+
     async def search(
         self,
         query: str,
@@ -443,13 +627,11 @@ class BucketManager:
         domain_filter: list[str] = None,
         query_valence: float = None,
         query_arousal: float = None,
+        profile: str = "",
     ) -> list[dict]:
         """
-        Multi-dimensional indexed search for memory buckets.
-        多维索引搜索记忆桶。
-
-        domain_filter: pre-filter by domain (None = search all)
-        query_valence/arousal: emotion coordinates for resonance scoring
+        Multi-dimensional indexed search.
+        profile="" → shared only. profile="cc" → shared+cc.
         """
         if not query or not query.strip():
             return []
@@ -460,177 +642,100 @@ class BucketManager:
         if not all_buckets:
             return []
 
-        # --- Layer 1: domain pre-filter (fast scope reduction) ---
-        # --- 第一层：主题域预筛（快速缩小范围）---
+        # Profile filter (always applied; default "" = shared only)
+        all_buckets = self.filter_by_profile(all_buckets, profile)
+        if not all_buckets:
+            return []
+
+        # Domain pre-filter
         if domain_filter:
             filter_set = {d.lower() for d in domain_filter}
             candidates = [
                 b for b in all_buckets
                 if {d.lower() for d in b["metadata"].get("domain", [])} & filter_set
             ]
-            # Fall back to full search if pre-filter yields nothing
-            # 预筛为空则回退全量搜索
             if not candidates:
                 candidates = all_buckets
         else:
             candidates = all_buckets
 
-        # --- Layer 1.5: embedding pre-filter (optional, reduces multi-dim ranking set) ---
-        # --- 第1.5层：embedding 预筛（可选，缩小精排候选集）---
+        # Embedding pre-filter (optional)
         if self.embedding_engine and self.embedding_engine.enabled:
             try:
                 vector_results = await self.embedding_engine.search_similar(query, top_k=50)
                 if vector_results:
                     vector_ids = {bid for bid, _ in vector_results}
                     emb_candidates = [b for b in candidates if b["id"] in vector_ids]
-                    if emb_candidates:  # only replace if there's non-empty overlap
+                    if emb_candidates:
                         candidates = emb_candidates
-                    # else: keep original candidates as fallback
             except Exception as e:
-                logger.warning(f"Embedding pre-filter failed, using fuzzy only / embedding 预筛失败: {e}")
+                logger.warning(f"Embedding pre-filter failed: {e}")
 
-        # --- Layer 2: weighted multi-dim ranking ---
-        # --- 第二层：多维加权精排 ---
+        # Multi-dim ranking
         scored = []
         for bucket in candidates:
             meta = bucket.get("metadata", {})
-
             try:
-                # Dim 1: topic relevance (fuzzy text, 0~1)
                 topic_score = self._calc_topic_score(query, bucket)
-
-                # Dim 2: emotion resonance (coordinate distance, 0~1)
-                emotion_score = self._calc_emotion_score(
-                    query_valence, query_arousal, meta
-                )
-
-                # Dim 3: time proximity (exponential decay, 0~1)
+                emotion_score = self._calc_emotion_score(query_valence, query_arousal, meta)
                 time_score = self._calc_time_score(meta)
-
-                # Dim 4: importance (direct normalization)
                 importance_score = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
 
-                # --- Weighted sum / 加权求和 ---
                 total = (
                     topic_score * self.w_topic
                     + emotion_score * self.w_emotion
                     + time_score * self.w_time
                     + importance_score * self.w_importance
                 )
-                # Normalize to 0~100 for readability
                 weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
 
-                # Threshold check uses raw (pre-penalty) score so resolved buckets
-                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
-                # remain reachable by keyword (penalty applied only to ranking).
                 if normalized >= self.fuzzy_threshold:
-                    # Resolved buckets get ranking penalty (but still reachable by keyword)
-                    # 已解决的桶仅在排序时降权
                     if meta.get("resolved", False):
                         normalized *= 0.3
                     bucket["score"] = round(normalized, 2)
                     scored.append(bucket)
             except Exception as e:
-                logger.warning(
-                    f"Scoring failed for bucket {bucket.get('id', '?')} / "
-                    f"桶评分失败: {e}"
-                )
+                logger.warning(f"Scoring failed for {bucket.get('id', '?')}: {e}")
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
-    # ---------------------------------------------------------
-    # Topic relevance sub-score:
-    # name(×3) + domain(×2.5) + tags(×2) + body(×1)
-    # 文本相关性子分：桶名(×3) + 主题域(×2.5) + 标签(×2) + 正文(×1)
-    # ---------------------------------------------------------
-    def _calc_topic_score(self, query: str, bucket: dict) -> float:
-        """
-        Calculate text dimension relevance score (0~1).
-        计算文本维度的相关性得分。
-        """
-        meta = bucket.get("metadata", {})
+    # =========================================================
+    # List all
+    # =========================================================
 
-        name_score = fuzz.partial_ratio(query, meta.get("name", "")) * 3
-        domain_score = (
-            max(
-                (fuzz.partial_ratio(query, d) for d in meta.get("domain", [])),
-                default=0,
-            )
-            * 2.5
-        )
-        tag_score = (
-            max(
-                (fuzz.partial_ratio(query, tag) for tag in meta.get("tags", [])),
-                default=0,
-            )
-            * 2
-        )
-        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:1000]) * self.content_weight
-
-        return (name_score + domain_score + tag_score + content_score) / (100 * (3 + 2.5 + 2 + self.content_weight))
-
-    # ---------------------------------------------------------
-    # Emotion resonance sub-score:
-    # Based on Russell circumplex Euclidean distance
-    # 情感共鸣子分：基于环形情感模型的欧氏距离
-    # No emotion in query → neutral 0.5 (doesn't affect ranking)
-    # ---------------------------------------------------------
-    def _calc_emotion_score(
-        self, q_valence: float, q_arousal: float, meta: dict
-    ) -> float:
-        """
-        Calculate emotion resonance score (0~1, closer = higher).
-        计算情感共鸣度（0~1，越近越高）。
-        """
-        if q_valence is None or q_arousal is None:
-            return 0.5  # No emotion coordinates → neutral / 无情感坐标时给中性分
-
-        try:
-            b_valence = float(meta.get("valence", 0.5))
-            b_arousal = float(meta.get("arousal", 0.3))
-        except (ValueError, TypeError):
-            return 0.5
-
-        # Euclidean distance, max sqrt(2) ≈ 1.414
-        dist = math.sqrt((q_valence - b_valence) ** 2 + (q_arousal - b_arousal) ** 2)
-        return max(0.0, 1.0 - dist / 1.414)
-
-    # ---------------------------------------------------------
-    # Time proximity sub-score:
-    # More recent activation → higher score
-    # 时间亲近子分：距上次激活越近分越高
-    # ---------------------------------------------------------
-    def _calc_time_score(self, meta: dict) -> float:
-        """
-        Calculate time proximity score (0~1, more recent = higher).
-        计算时间亲近度。
-        """
-        last_active_str = meta.get("last_active", meta.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days = 30
-        return math.exp(-0.02 * days)
-
-    # ---------------------------------------------------------
-    # List all buckets
-    # 列出所有桶
-    # ---------------------------------------------------------
     async def list_all(self, include_archive: bool = False) -> list[dict]:
-        """
-        Recursively walk directories (including domain subdirs), list all buckets.
-        递归遍历目录（含域子目录），列出所有记忆桶。
-        """
-        buckets = []
+        """List all non-deleted buckets."""
+        if self.use_supabase:
+            try:
+                query = self.supabase.table(self.memory_table).select("*")
+                if not include_archive:
+                    query = query.neq("bucket_type", "archived")
+                result = query.execute()
+                rows = result.data or []
+                # Exclude soft-deleted rows (Python-side, JSONB filter is complex)
+                rows = [r for r in rows if not (r.get("raw") or {}).get("ombre_deleted")]
+                buckets = [self._row_to_bucket(r) for r in rows]
+                buckets.sort(
+                    key=lambda b: (
+                        b["metadata"].get("last_active")
+                        or b["metadata"].get("created")
+                        or ""
+                    ),
+                    reverse=True,
+                )
+                return buckets
+            except Exception as e:
+                logger.error(f"Supabase list_all failed: {e}")
+                return []
 
+        # --- File backend ---
+        buckets = []
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
             dirs.append(self.archive_dir)
-
         for dir_path in dirs:
             if not os.path.exists(dir_path):
                 continue
@@ -638,22 +743,51 @@ class BucketManager:
                 for filename in files:
                     if not filename.endswith(".md"):
                         continue
-                    file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
+                    bucket = self._load_bucket(os.path.join(root, filename))
                     if bucket:
                         buckets.append(bucket)
-
         return buckets
 
-    # ---------------------------------------------------------
-    # Statistics (counts per category + total size)
-    # 统计信息（各分类桶数量 + 总体积）
-    # ---------------------------------------------------------
+    # =========================================================
+    # Stats
+    # =========================================================
+
     async def get_stats(self) -> dict:
-        """
-        Return memory bucket statistics (including domain subdirs).
-        返回记忆桶的统计数据。
-        """
+        """Return memory bucket statistics."""
+        if self.use_supabase:
+            try:
+                all_buckets = await self.list_all(include_archive=True)
+                stats = {
+                    "permanent_count": 0,
+                    "dynamic_count": 0,
+                    "archive_count": 0,
+                    "feel_count": 0,
+                    "total_size_kb": 0.0,
+                    "domains": {},
+                }
+                for b in all_buckets:
+                    btype = b["metadata"].get("type", "dynamic")
+                    stats["total_size_kb"] += len(b.get("content") or "") / 1024
+                    if btype == "permanent" or b["metadata"].get("pinned"):
+                        stats["permanent_count"] += 1
+                    elif btype == "feel":
+                        stats["feel_count"] += 1
+                    elif btype == "archived":
+                        stats["archive_count"] += 1
+                    else:
+                        stats["dynamic_count"] += 1
+                    for d in b["metadata"].get("domain", []):
+                        stats["domains"][d] = stats["domains"].get(d, 0) + 1
+                return stats
+            except Exception as e:
+                logger.error(f"Supabase get_stats failed: {e}")
+                return {
+                    "permanent_count": 0, "dynamic_count": 0,
+                    "archive_count": 0, "feel_count": 0,
+                    "total_size_kb": 0.0, "domains": {},
+                }
+
+        # --- File backend ---
         stats = {
             "permanent_count": 0,
             "dynamic_count": 0,
@@ -662,7 +796,6 @@ class BucketManager:
             "total_size_kb": 0.0,
             "domains": {},
         }
-
         for subdir, key in [
             (self.permanent_dir, "permanent_count"),
             (self.dynamic_dir, "dynamic_count"),
@@ -675,70 +808,84 @@ class BucketManager:
                 for f in files:
                     if f.endswith(".md"):
                         stats[key] += 1
-                        fpath = os.path.join(root, f)
                         try:
-                            stats["total_size_kb"] += os.path.getsize(fpath) / 1024
+                            stats["total_size_kb"] += os.path.getsize(
+                                os.path.join(root, f)
+                            ) / 1024
                         except OSError:
                             pass
-                        # Per-domain counts / 每个域的桶数量
                         domain_name = os.path.basename(root)
                         if domain_name != os.path.basename(subdir):
-                            stats["domains"][domain_name] = stats["domains"].get(domain_name, 0) + 1
-
+                            stats["domains"][domain_name] = (
+                                stats["domains"].get(domain_name, 0) + 1
+                            )
         return stats
 
-    # ---------------------------------------------------------
-    # Archive bucket (move from permanent/dynamic into archive)
-    # 归档桶（从 permanent/dynamic 移入 archive）
-    # Called by decay engine to simulate "forgetting"
-    # 由衰减引擎调用，模拟"遗忘"
-    # ---------------------------------------------------------
+    # =========================================================
+    # Archive
+    # =========================================================
+
     async def archive(self, bucket_id: str) -> bool:
-        """
-        Move a bucket into the archive directory (preserving domain subdirs).
-        将指定桶移入归档目录（保留域子目录结构）。
-        """
+        """Move bucket to archived state."""
+        if self.use_supabase:
+            try:
+                result = self.supabase.table(self.memory_table).select(
+                    "raw"
+                ).eq("bucket_id", bucket_id).execute()
+                if not result.data:
+                    return False
+                existing_raw = dict(result.data[0].get("raw") or {})
+                meta = dict(existing_raw.get("ombre_metadata") or {})
+                meta["type"] = "archived"
+                existing_raw["ombre_metadata"] = meta
+                self.supabase.table(self.memory_table).update({
+                    "bucket_type": "archived",
+                    "raw": existing_raw,
+                    "updated_at": now_iso(),
+                }).eq("bucket_id", bucket_id).execute()
+                logger.info(f"Archived bucket (supabase): {bucket_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Supabase archive failed for {bucket_id}: {e}")
+                return False
+
+        # --- File backend ---
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
-
         try:
-            # Read once, get domain info and update type / 一次性读取
             post = frontmatter.load(file_path)
             domain = post.get("domain", ["未分类"])
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
             os.makedirs(archive_subdir, exist_ok=True)
-
             dest = safe_path(archive_subdir, os.path.basename(file_path))
-
-            # Update type marker then move file / 更新类型标记后移动文件
             post["type"] = "archived"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
-
-            # Use shutil.move for cross-filesystem safety
-            # 使用 shutil.move 保证跨文件系统安全
             shutil.move(file_path, str(dest))
         except Exception as e:
-            logger.error(
-                f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
-            )
+            logger.error(f"Failed to archive bucket: {bucket_id}: {e}")
             return False
-
-        logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
+        logger.info(f"Archived bucket: {bucket_id} → archive/{primary_domain}/")
         return True
 
-    # ---------------------------------------------------------
-    # Internal: find bucket file across all three directories
-    # 内部：在三个目录中查找桶文件
-    # ---------------------------------------------------------
+    # =========================================================
+    # File backend internals
+    # =========================================================
+
+    def _move_bucket(self, file_path: str, target_type_dir: str, domain: list[str] = None) -> str:
+        primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+        target_dir = os.path.join(target_type_dir, primary_domain)
+        os.makedirs(target_dir, exist_ok=True)
+        filename = os.path.basename(file_path)
+        new_path = safe_path(target_dir, filename)
+        if os.path.normpath(file_path) != os.path.normpath(new_path):
+            os.rename(file_path, new_path)
+            logger.info(f"Moved bucket: {filename} → {target_dir}/")
+        return new_path
+
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
-        """
-        Recursively search permanent/dynamic/archive for a bucket file
-        matching the given ID.
-        在 permanent/dynamic/archive 中递归查找指定 ID 的桶文件。
-        """
         if not bucket_id:
             return None
         for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir]:
@@ -748,22 +895,12 @@ class BucketManager:
                 for fname in files:
                     if not fname.endswith(".md"):
                         continue
-                    # Match by exact ID segment in filename
-                    # 通过文件名中的 ID 片段精确匹配
-                    name_part = fname[:-3]  # remove .md
+                    name_part = fname[:-3]
                     if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
                         return os.path.join(root, fname)
         return None
 
-    # ---------------------------------------------------------
-    # Internal: load bucket data from .md file
-    # 内部：从 .md 文件加载桶数据
-    # ---------------------------------------------------------
     def _load_bucket(self, file_path: str) -> Optional[dict]:
-        """
-        Parse a Markdown file and return structured bucket data.
-        解析 Markdown 文件，返回桶的结构化数据。
-        """
         try:
             post = frontmatter.load(file_path)
             return {
@@ -773,7 +910,45 @@ class BucketManager:
                 "path": file_path,
             }
         except Exception as e:
-            logger.warning(
-                f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
-            )
+            logger.warning(f"Failed to load bucket file: {file_path}: {e}")
             return None
+
+    # =========================================================
+    # Scoring (used by both backends via search)
+    # =========================================================
+
+    def _calc_topic_score(self, query: str, bucket: dict) -> float:
+        meta = bucket.get("metadata", {})
+        name_score = fuzz.partial_ratio(query, meta.get("name", "")) * 3
+        domain_score = (
+            max((fuzz.partial_ratio(query, d) for d in meta.get("domain", [])), default=0) * 2.5
+        )
+        tag_score = (
+            max((fuzz.partial_ratio(query, tag) for tag in meta.get("tags", [])), default=0) * 2
+        )
+        content_score = (
+            fuzz.partial_ratio(query, bucket.get("content", "")[:1000]) * self.content_weight
+        )
+        return (name_score + domain_score + tag_score + content_score) / (
+            100 * (3 + 2.5 + 2 + self.content_weight)
+        )
+
+    def _calc_emotion_score(self, q_valence: float, q_arousal: float, meta: dict) -> float:
+        if q_valence is None or q_arousal is None:
+            return 0.5
+        try:
+            b_valence = float(meta.get("valence", 0.5))
+            b_arousal = float(meta.get("arousal", 0.3))
+        except (ValueError, TypeError):
+            return 0.5
+        dist = math.sqrt((q_valence - b_valence) ** 2 + (q_arousal - b_arousal) ** 2)
+        return max(0.0, 1.0 - dist / 1.414)
+
+    def _calc_time_score(self, meta: dict) -> float:
+        last_active_str = meta.get("last_active", meta.get("created", ""))
+        try:
+            last_active = datetime.fromisoformat(str(last_active_str))
+            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            days = 30
+        return math.exp(-0.02 * days)

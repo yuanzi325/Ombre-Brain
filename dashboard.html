@@ -1258,10 +1258,76 @@ async function showDetail(id) {
         '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
       '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+      '<div class="detail-content">' + esc(b.content) + '</div>' +
+      '<div class="config-section" style="margin-top:22px;">' +
+        '<h3>编辑记忆桶</h3>' +
+        '<label style="font-size:12px;color:var(--text-dim);">标题</label>' +
+        '<input id="edit-name" value="' + esc(meta.name || '') + '" style="width:100%;margin:6px 0 12px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" />' +
+        '<label style="font-size:12px;color:var(--text-dim);">正文</label>' +
+        '<textarea id="edit-content" style="width:100%;min-height:180px;margin:6px 0 12px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-family:inherit;font-size:13px;line-height:1.6;">' + esc(b.content) + '</textarea>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">重要度 1-10</label><input id="edit-importance" type="number" min="1" max="10" value="' + (meta.importance || 5) + '" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">Profiles</label><input id="edit-profiles" value="' + esc((meta.profiles || ['shared']).join(', ')) + '" placeholder="shared, cc, cx" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">Domain</label><input id="edit-domain" value="' + esc((meta.domain || []).join(', ')) + '" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">Tags</label><input id="edit-tags" value="' + esc((meta.tags || []).join(', ')) + '" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">Valence 0-1</label><input id="edit-valence" type="number" min="0" max="1" step="0.01" value="' + (meta.valence ?? 0.5) + '" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+          '<div><label style="font-size:12px;color:var(--text-dim);">Arousal 0-1</label><input id="edit-arousal" type="number" min="0" max="1" step="0.01" value="' + (meta.arousal ?? 0.3) + '" style="width:100%;margin-top:6px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);" /></div>' +
+        '</div>' +
+        '<div style="display:flex;gap:14px;flex-wrap:wrap;margin:14px 0;">' +
+          '<label><input id="edit-pinned" type="checkbox" ' + (meta.pinned ? 'checked' : '') + '> 钉选</label>' +
+          '<label><input id="edit-protected" type="checkbox" ' + (meta.protected ? 'checked' : '') + '> 保护</label>' +
+          '<label><input id="edit-resolved" type="checkbox" ' + (meta.resolved ? 'checked' : '') + '> 已解决</label>' +
+          '<label><input id="edit-digested" type="checkbox" ' + (meta.digested ? 'checked' : '') + '> 已消化</label>' +
+        '</div>' +
+        '<div style="display:flex;gap:10px;align-items:center;">' +
+          '<button class="btn-primary" onclick="saveBucketEdit(\\'' + id + '\\')">保存修改</button>' +
+          '<span id="edit-save-msg" style="font-size:12px;color:var(--text-dim);"></span>' +
+        '</div>' +
+      '</div>';
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
+}
+
+function splitListInput(value) {
+  return String(value || '').split(/[，,、;；\n]/).map(function(x) { return x.trim(); }).filter(Boolean);
+}
+
+async function saveBucketEdit(id) {
+  const msg = document.getElementById('edit-save-msg');
+  msg.style.color = 'var(--text-dim)';
+  msg.textContent = '保存中…';
+  const payload = {
+    name: document.getElementById('edit-name').value,
+    content: document.getElementById('edit-content').value,
+    importance: Number(document.getElementById('edit-importance').value || 5),
+    profiles: splitListInput(document.getElementById('edit-profiles').value),
+    domain: splitListInput(document.getElementById('edit-domain').value),
+    tags: splitListInput(document.getElementById('edit-tags').value),
+    valence: Number(document.getElementById('edit-valence').value || 0.5),
+    arousal: Number(document.getElementById('edit-arousal').value || 0.3),
+    pinned: document.getElementById('edit-pinned').checked,
+    protected: document.getElementById('edit-protected').checked,
+    resolved: document.getElementById('edit-resolved').checked,
+    digested: document.getElementById('edit-digested').checked,
+  };
+  if (!payload.profiles.length) payload.profiles = ['shared'];
+  const resp = await authFetch(BASE + '/api/bucket/' + id, {
+    method: 'PATCH',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (!resp) return;
+  const data = await resp.json();
+  if (!resp.ok) {
+    msg.style.color = 'var(--negative)';
+    msg.textContent = data.error || '保存失败';
+    return;
+  }
+  msg.style.color = 'var(--accent)';
+  msg.textContent = '已保存';
+  await loadBuckets();
+  await showDetail(id);
 }
 
 function closeDetail() {

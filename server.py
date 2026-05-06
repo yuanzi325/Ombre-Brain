@@ -1366,6 +1366,69 @@ async def api_bucket_detail(request):
     })
 
 
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["PATCH"])
+async def api_bucket_update(request):
+    """Update bucket content and editable metadata from the dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    updates = {}
+    if "content" in body:
+        updates["content"] = str(body.get("content") or "")
+    if "name" in body:
+        updates["name"] = str(body.get("name") or "").strip()
+    for key in ("tags", "domain", "profiles"):
+        if key in body:
+            value = body.get(key)
+            if isinstance(value, str):
+                value = [x.strip() for x in value.replace("，", ",").split(",") if x.strip()]
+            elif isinstance(value, list):
+                value = [str(x).strip() for x in value if str(x).strip()]
+            else:
+                value = []
+            if key == "profiles" and not value:
+                value = ["shared"]
+            updates[key] = value
+    for key in ("valence", "arousal"):
+        if key in body:
+            try:
+                updates[key] = max(0.0, min(1.0, float(body.get(key))))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": f"{key} must be a number between 0 and 1"}, status_code=400)
+    if "importance" in body:
+        try:
+            updates["importance"] = max(1, min(10, int(body.get("importance"))))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "importance must be an integer between 1 and 10"}, status_code=400)
+    for key in ("resolved", "pinned", "protected", "digested"):
+        if key in body:
+            updates[key] = bool(body.get(key))
+
+    if not updates:
+        return JSONResponse({"error": "no editable fields provided"}, status_code=400)
+    ok = await bucket_mgr.update(bucket_id, **updates)
+    if not ok:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+    updated = await bucket_mgr.get(bucket_id)
+    meta = updated.get("metadata", {}) if updated else {}
+    return JSONResponse({
+        "ok": True,
+        "id": bucket_id,
+        "metadata": meta,
+        "content": strip_wikilinks(updated.get("content", "")) if updated else "",
+        "score": decay_engine.calculate_score(meta) if updated else 0,
+    })
+
+
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""

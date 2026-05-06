@@ -33,12 +33,23 @@ def load_config(config_path: str = None) -> dict:
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
         "merge_threshold": 75,
+        "storage": {
+            "backend": "file",  # "file" | "supabase"
+        },
+        "supabase": {
+            "url": "",
+            "key": "",
+            "memory_table": "memories",
+        },
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
             "api_key": "",
             "max_tokens": 1024,
             "temperature": 0.1,
+        },
+        "embedding": {
+            "enabled": True,
         },
         "decay": {
             "lambda": 0.05,
@@ -118,11 +129,44 @@ def load_config(config_path: str = None) -> dict:
     if env_embed_base_url:
         config.setdefault("embedding", {})["base_url"] = env_embed_base_url
 
+    # OMBRE_EMBEDDING_ENABLED overrides embedding.enabled
+    env_embedding_enabled = os.environ.get("OMBRE_EMBEDDING_ENABLED", "").strip().lower()
+    if env_embedding_enabled in ("false", "0", "no", "off"):
+        config.setdefault("embedding", {})["enabled"] = False
+    elif env_embedding_enabled in ("true", "1", "yes", "on"):
+        config.setdefault("embedding", {})["enabled"] = True
+
+    # OMBRE_STORAGE_BACKEND overrides storage.backend ("file" or "supabase")
+    env_storage_backend = os.environ.get("OMBRE_STORAGE_BACKEND", "").strip().lower()
+    if env_storage_backend in ("file", "supabase"):
+        config.setdefault("storage", {})["backend"] = env_storage_backend
+
+    # SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / SUPABASE_KEY / MEMORY_TABLE
+    env_supabase_url = os.environ.get("SUPABASE_URL", "").strip()
+    if env_supabase_url:
+        config.setdefault("supabase", {})["url"] = env_supabase_url
+
+    env_supabase_key = (
+        os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        or os.environ.get("SUPABASE_KEY", "").strip()
+    )
+    if env_supabase_key:
+        config.setdefault("supabase", {})["key"] = env_supabase_key
+
+    env_memory_table = os.environ.get("MEMORY_TABLE", "").strip()
+    if env_memory_table:
+        config.setdefault("supabase", {})["memory_table"] = env_memory_table
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
+    # In supabase mode, only create the base dir (for SQLite cache / embeddings.db).
+    # Subdirectories are not needed when buckets live in Supabase.
     buckets_dir = config["buckets_dir"]
-    for subdir in ["permanent", "dynamic", "archive"]:
-        os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
+    if config.get("storage", {}).get("backend", "file") == "supabase":
+        os.makedirs(buckets_dir, exist_ok=True)
+    else:
+        for subdir in ["permanent", "dynamic", "archive"]:
+            os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
 
     return config
 

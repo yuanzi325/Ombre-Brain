@@ -154,7 +154,7 @@
   .bucket-list { display: flex; flex-direction: column; gap: 8px; }
   .bucket-row {
     display: grid;
-    grid-template-columns: 32px 200px 100px 80px 60px 100px 1fr;
+    grid-template-columns: 32px 200px 100px 80px 60px 100px 70px 1fr;
     gap: 12px;
     padding: 14px 20px;
     border-radius: 16px;
@@ -204,6 +204,20 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .bucket-row .profiles {
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .filter-divider {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+    flex-shrink: 0;
+    align-self: center;
   }
 
   .v-bar {
@@ -591,6 +605,7 @@
     .bucket-row .domain,
     .bucket-row .emotion,
     .bucket-row .time,
+    .bucket-row .profiles,
     .bucket-row .preview { display: none; }
     .detail-panel { width: 100%; }
     .config-row { flex-wrap: wrap; }
@@ -680,6 +695,13 @@
       <label><input type="checkbox" id="import-preserve-raw" /> 保留原文模式（特殊情境/暗号/仪式性内容不摘要）</label>
     </div>
 
+    <div style="margin:12px 0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span style="font-size:12px;color:var(--text-dim);">导入到</span>
+      <button class="filter-btn active" data-import-profile="shared" onclick="switchImportProfile('shared')">Shared</button>
+      <button class="filter-btn" data-import-profile="cc" onclick="switchImportProfile('cc')">CC</button>
+      <button class="filter-btn" data-import-profile="cx" onclick="switchImportProfile('cx')">CX</button>
+    </div>
+
     <div id="import-progress" style="display:none;margin:20px 0;">
       <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
         <span id="import-status-text">准备中…</span>
@@ -688,10 +710,12 @@
       <div style="background:var(--surface);border-radius:8px;height:12px;overflow:hidden;">
         <div id="import-progress-bar" style="height:100%;background:var(--accent);border-radius:8px;transition:width .3s;width:0%;"></div>
       </div>
-      <div style="display:flex;gap:16px;margin-top:8px;font-size:13px;color:var(--text-dim);">
-        <span>API调用: <b id="import-api-calls">0</b></span>
-        <span>新建: <b id="import-created">0</b></span>
+      <div style="display:flex;gap:12px;margin-top:8px;font-size:13px;color:var(--text-dim);flex-wrap:wrap;">
+        <span>API: <b id="import-api-calls">0</b></span>
+        <span>新建: <b id="import-new">0</b></span>
         <span>合并: <b id="import-merged">0</b></span>
+        <span>候选: <b id="import-merge-candidate">0</b></span>
+        <span>跳过: <b id="import-skipped">0</b></span>
         <span>原文: <b id="import-raw">0</b></span>
       </div>
       <div style="margin-top:12px;">
@@ -1036,6 +1060,8 @@ async function authFetch(url, options) {
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+let currentProfile = '';
+let currentImportProfile = 'shared';
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -1067,7 +1093,8 @@ document.getElementById('search-input').addEventListener('input', (e) => {
 
 async function loadBuckets() {
   try {
-    const res = await fetch(BASE + '/api/buckets');
+    const url = currentProfile ? BASE + '/api/buckets?profile=' + encodeURIComponent(currentProfile) : BASE + '/api/buckets';
+    const res = await fetch(url);
     const data = await res.json();
     if (!res.ok || !Array.isArray(data)) {
       throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
@@ -1075,7 +1102,9 @@ async function loadBuckets() {
     allBuckets = data;
     updateStats();
     buildFilters();
-    renderBuckets(allBuckets);
+    const q = document.getElementById('search-input').value.trim();
+    if (q) searchBuckets(q);
+    else renderBuckets(filterBuckets(allBuckets));
   } catch (e) {
     document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
@@ -1092,10 +1121,19 @@ function updateStats() {
 }
 
 function buildFilters() {
-  const domains = new Set();
-  allBuckets.forEach(b => (b.domain || []).forEach(d => domains.add(d)));
-  const filters = document.getElementById('filters');
-  const types = [
+  var domains = new Set();
+  allBuckets.forEach(function(b) { (b.domain || []).forEach(function(d) { domains.add(d); }); });
+  var filters = document.getElementById('filters');
+  var profileOptions = [
+    { key: '', label: '全部' },
+    { key: 'shared', label: 'Shared' },
+    { key: 'cc', label: 'CC' },
+    { key: 'cx', label: 'CX' },
+  ];
+  var profileBtns = profileOptions.map(function(p) {
+    return '<button class="filter-btn' + (p.key === currentProfile ? ' active' : '') + '" data-profile="' + p.key + '">' + p.label + '</button>';
+  }).join('');
+  var types = [
     { key: 'all', label: '全部' },
     { key: 'pinned', label: '📌 钉选' },
     { key: 'feel', label: '🫧 Feel' },
@@ -1103,19 +1141,34 @@ function buildFilters() {
     { key: 'digested', label: '🌿 已消化' },
     { key: 'archived', label: '📦 归档' },
   ];
-  filters.innerHTML = types.map(function(t) {
-    return '<button class="filter-btn ' + (t.key === 'all' ? 'active' : '') + '" data-filter="' + t.key + '">' + t.label + '</button>';
-  }).join('') + Array.from(domains).slice(0, 10).map(function(d) {
+  var typeBtns = types.map(function(t) {
+    return '<button class="filter-btn' + (t.key === currentFilter ? ' active' : '') + '" data-filter="' + t.key + '">' + t.label + '</button>';
+  }).join('');
+  var domainBtns = Array.from(domains).slice(0, 10).map(function(d) {
     return '<button class="filter-btn" data-filter="domain:' + d + '">' + d + '</button>';
   }).join('');
+  filters.innerHTML = profileBtns + '<span class="filter-divider"></span>' + typeBtns + domainBtns;
+}
 
+function initFilterListeners() {
+  var filters = document.getElementById('filters');
   filters.addEventListener('click', function(e) {
     var btn = e.target.closest('.filter-btn');
     if (!btn) return;
-    filters.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
-    btn.classList.add('active');
-    currentFilter = btn.dataset.filter;
-    renderBuckets(filterBuckets(allBuckets));
+    if (btn.hasAttribute('data-profile')) {
+      filters.querySelectorAll('.filter-btn[data-profile]').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      currentProfile = btn.dataset.profile;
+      currentFilter = 'all';
+      loadBuckets();
+      return;
+    }
+    if (btn.hasAttribute('data-filter')) {
+      filters.querySelectorAll('.filter-btn[data-filter]').forEach(function(b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      currentFilter = btn.dataset.filter;
+      renderBuckets(filterBuckets(allBuckets));
+    }
   });
 }
 
@@ -1144,6 +1197,7 @@ function renderBuckets(buckets) {
     var vPos = Math.round(b.valence * 100);
     var modelV = b.model_valence != null ? ' → V' + b.model_valence.toFixed(1) : '';
     var timeAgo = formatTimeAgo(b.last_active || b.created);
+    var profilesText = (b.profiles && b.profiles.length) ? b.profiles.join(', ') : 'shared';
     return '<div class="bucket-row" onclick="showDetail(\'' + b.id + '\')">' +
       '<span class="icon">' + icon + '</span>' +
       '<span class="name" title="' + esc(b.name) + '">' + esc(b.name) + '</span>' +
@@ -1151,6 +1205,7 @@ function renderBuckets(buckets) {
       '<span class="emotion"><span class="v-bar"><span class="v-dot" style="left:' + vPos + '%"></span></span>' + modelV + '</span>' +
       '<span class="score">' + b.score.toFixed(2) + '</span>' +
       '<span class="time">' + timeAgo + '</span>' +
+      '<span class="profiles">' + esc(profilesText) + '</span>' +
       '<span class="preview">' + esc(b.content_preview) + '</span>' +
     '</div>';
   }).join('');
@@ -1158,7 +1213,9 @@ function renderBuckets(buckets) {
 
 async function searchBuckets(query) {
   try {
-    var res = await fetch(BASE + '/api/search?q=' + encodeURIComponent(query));
+    var url = BASE + '/api/search?q=' + encodeURIComponent(query);
+    if (currentProfile) url += '&profile=' + encodeURIComponent(currentProfile);
+    var res = await fetch(url);
     var results = await res.json();
     renderBuckets(results);
   } catch (e) {
@@ -1497,6 +1554,14 @@ async function saveConfig(persist) {
   }
 }
 
+function switchImportProfile(profile) {
+  currentImportProfile = profile;
+  document.querySelectorAll('[data-import-profile]').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.importProfile === profile);
+  });
+}
+
+initFilterListeners();
 checkAuth().then(() => loadBuckets());
 
 // --- Import functions ---
@@ -1518,7 +1583,7 @@ async function startImport(file) {
   const fd = new FormData();
   fd.append('file', file);
   try {
-    const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0'), { method: 'POST', body: fd });
+    const res = await fetch(BASE + '/api/import/upload?preserve_raw=' + (preserveRaw ? '1' : '0') + '&profile=' + encodeURIComponent(currentImportProfile), { method: 'POST', body: fd });
     const data = await res.json();
     if (data.error) { alert('导入失败: ' + data.error); return; }
     document.getElementById('import-progress').style.display = '';
@@ -1553,8 +1618,10 @@ function updateImportUI(s) {
   document.getElementById('import-progress-bar').style.width = pct + '%';
   document.getElementById('import-progress-text').textContent = s.processed + '/' + s.total_chunks;
   document.getElementById('import-api-calls').textContent = s.api_calls;
-  document.getElementById('import-created').textContent = s.memories_created;
+  document.getElementById('import-new').textContent = s.memories_new || 0;
   document.getElementById('import-merged').textContent = s.memories_merged;
+  document.getElementById('import-merge-candidate').textContent = s.memories_merge_candidate || 0;
+  document.getElementById('import-skipped').textContent = s.memories_skipped || 0;
   document.getElementById('import-raw').textContent = s.memories_raw;
   const statusMap = { running: '⏳ 导入中…', paused: '⏸ 已暂停', completed: '✅ 完成', error: '❌ 出错' };
   document.getElementById('import-status-text').textContent = statusMap[s.status] || s.status;
@@ -1586,7 +1653,7 @@ async function loadImportResults() {
       <div id="ir-${b.id}" style="background:var(--surface);border-radius:12px;padding:14px;margin:8px 0;">
         <div style="display:flex;justify-content:space-between;align-items:center;">
           <b>${b.name || b.id}</b>
-          <span style="font-size:11px;color:var(--text-dim);">${b.type} | ${(b.domain||[]).join(',')} | imp:${b.importance}</span>
+          <span style="font-size:11px;color:var(--text-dim);">${b.type} | profiles:${(b.profiles||['shared']).join(',')} | ${(b.domain||[]).join(',')} | imp:${b.importance}</span>
         </div>
         <p style="font-size:13px;margin:6px 0;white-space:pre-wrap;">${b.content}</p>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">${(b.tags||[]).map(t=>'#'+t).join(' ')}</div>

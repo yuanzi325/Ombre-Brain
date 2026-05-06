@@ -157,6 +157,21 @@ def load_config(config_path: str = None) -> dict:
     if env_memory_table:
         config.setdefault("supabase", {})["memory_table"] = env_memory_table
 
+    # --- Supabase mode: require URL and key, never silently fallback ---
+    # --- Supabase 模式：缺 URL 或 key 立即报错，不静默回退到 file ---
+    if config.get("storage", {}).get("backend", "file") == "supabase":
+        missing = []
+        if not config.get("supabase", {}).get("url", "").strip():
+            missing.append("SUPABASE_URL")
+        if not config.get("supabase", {}).get("key", "").strip():
+            missing.append("SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY)")
+        if missing:
+            raise RuntimeError(
+                f"OMBRE_STORAGE_BACKEND=supabase but required env vars are missing: "
+                f"{', '.join(missing)}. "
+                f"Set them before starting. Will NOT fall back to file backend."
+            )
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     # In supabase mode, only create the base dir (for SQLite cache / embeddings.db).

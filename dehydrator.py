@@ -174,15 +174,19 @@ class Dehydrator:
         self.api_available = bool(self.api_key)
 
         # --- Initialize OpenAI-compatible client ---
-        # --- 初始化 OpenAI 兼容客户端 ---
         if self.api_available:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
                 timeout=60.0,
             )
+            logger.info(f"Dehydrator: model={self.model}, base_url={self.base_url}")
         else:
             self.client = None
+            logger.warning(
+                "Dehydrator: no API key configured (OMBRE_API_KEY not set). "
+                "analyze/dehydrate/merge/digest will raise RuntimeError when called."
+            )
 
         # --- SQLite dehydration cache ---
         # --- SQLite 脱水缓存：content hash → summary ---
@@ -308,19 +312,21 @@ class Dehydrator:
     # API 调用：脱水压缩
     # ---------------------------------------------------------
     async def _api_dehydrate(self, content: str) -> str:
-        """
-        Call LLM API for intelligent dehydration (via OpenAI-compatible client).
-        调用 LLM API 执行智能脱水。
-        """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DEHYDRATE_PROMPT},
-                {"role": "user", "content": content[:3000]},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
+        """Call LLM API for intelligent dehydration."""
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": DEHYDRATE_PROMPT},
+                    {"role": "user", "content": content[:3000]},
+                ],
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Dehydration API call failed (model={self.model}, base_url={self.base_url}): {e}"
+            ) from e
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -330,20 +336,22 @@ class Dehydrator:
     # API 调用：合并
     # ---------------------------------------------------------
     async def _api_merge(self, old_content: str, new_content: str) -> str:
-        """
-        Call LLM API for intelligent merge (via OpenAI-compatible client).
-        调用 LLM API 执行智能合并。
-        """
+        """Call LLM API for intelligent merge."""
         user_msg = f"旧记忆：\n{old_content[:2000]}\n\n新内容：\n{new_content[:2000]}"
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": MERGE_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": MERGE_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Merge API call failed (model={self.model}, base_url={self.base_url}): {e}"
+            ) from e
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -422,19 +430,21 @@ class Dehydrator:
     # API 调用：自动打标
     # ---------------------------------------------------------
     async def _api_analyze(self, content: str) -> dict:
-        """
-        Call LLM API for content analysis / tagging.
-        调用 LLM API 执行内容分析打标。
-        """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": ANALYZE_PROMPT},
-                {"role": "user", "content": content[:2000]},
-            ],
-            max_tokens=256,
-            temperature=0.1,
-        )
+        """Call LLM API for content analysis / tagging."""
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": ANALYZE_PROMPT},
+                    {"role": "user", "content": content[:2000]},
+                ],
+                max_tokens=256,
+                temperature=0.1,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Analyze API call failed (model={self.model}, base_url={self.base_url}): {e}"
+            ) from e
         if not response.choices:
             return self._default_analysis()
         raw = response.choices[0].message.content or ""
@@ -532,19 +542,21 @@ class Dehydrator:
     # API 调用：日记整理
     # ---------------------------------------------------------
     async def _api_digest(self, content: str) -> list[dict]:
-        """
-        Call LLM API for diary organization.
-        调用 LLM API 执行日记整理。
-        """
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DIGEST_PROMPT},
-                {"role": "user", "content": content[:5000]},
-            ],
-            max_tokens=2048,
-            temperature=0.0,
-        )
+        """Call LLM API for diary organization."""
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": DIGEST_PROMPT},
+                    {"role": "user", "content": content[:5000]},
+                ],
+                max_tokens=2048,
+                temperature=0.0,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Digest API call failed (model={self.model}, base_url={self.base_url}): {e}"
+            ) from e
         if not response.choices:
             return []
         raw = response.choices[0].message.content or ""

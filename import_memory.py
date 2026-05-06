@@ -277,9 +277,12 @@ class ImportState:
             "total_chunks": 0,
             "processed": 0,
             "api_calls": 0,
-            "memories_created": 0,
-            "memories_merged": 0,
-            "memories_raw": 0,
+            "memories_created": 0,    # total successfully written (new + raw)
+            "memories_new": 0,        # created as brand-new bucket
+            "memories_merged": 0,     # merged into an existing bucket
+            "memories_merge_candidate": 0,  # similar bucket found but blocked (core/identity/cross-profile)
+            "memories_raw": 0,        # stored in raw/preserve mode
+            "memories_skipped": 0,    # filtered out (empty, no extraction result)
             "errors": [],
             "status": "idle",  # idle | running | paused | completed | error
             "started_at": "",
@@ -316,8 +319,11 @@ class ImportState:
             "processed": 0,
             "api_calls": 0,
             "memories_created": 0,
+            "memories_new": 0,
             "memories_merged": 0,
+            "memories_merge_candidate": 0,
             "memories_raw": 0,
+            "memories_skipped": 0,
             "errors": [],
             "status": "running",
             "started_at": now_iso(),
@@ -382,6 +388,61 @@ is_pattern: true = 反复出现的习惯性行为模式"""
 
 
 # ============================================================
+# Identity / core protection helpers
+# 身份、核心关系、核心偏好保护
+# ============================================================
+
+_IDENTITY_KEYWORDS: frozenset = frozenset({
+    "身份设定", "核心关系", "核心偏好", "世界观", "价值观",
+    "我的名字", "我叫", "角色设定", "性格设定",
+    "伴侣", "纪念日", "生日", "核心承诺",
+    "identity", "core relationship", "core preference",
+})
+
+_IDENTITY_DOMAINS: frozenset = frozenset({
+    "身份设定", "核心关系", "核心偏好", "设定",
+})
+
+
+def _is_identity_or_core(item: dict, bucket: dict = None) -> bool:
+    """
+    Return True if the memory item (or its merge target) represents core
+    identity / relationship / preference that should NOT be auto-merged.
+
+    Criteria (any one triggers):
+    - importance >= 9
+    - domain overlaps _IDENTITY_DOMAINS
+    - name / content (first 200 chars) / tags contain _IDENTITY_KEYWORDS
+    - target bucket is pinned / protected / permanent
+    """
+    try:
+        if int(item.get("importance", 0)) >= 9:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    content_lower = (item.get("content") or "").lower()[:200]
+    name_lower = (item.get("name") or "").lower()
+    domains = {(d or "").lower() for d in (item.get("domain") or [])}
+    tags = {(t or "").lower() for t in (item.get("tags") or [])}
+
+    if domains & {d.lower() for d in _IDENTITY_DOMAINS}:
+        return True
+
+    for kw in _IDENTITY_KEYWORDS:
+        kw_l = kw.lower()
+        if kw_l in name_lower or kw_l in content_lower or kw_l in tags:
+            return True
+
+    if bucket is not None:
+        meta = bucket.get("metadata", {})
+        if meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent":
+            return True
+
+    return False
+
+
+# ============================================================
 # Import Engine — core processing logic
 # 导入引擎 — 核心处理逻辑
 # ============================================================
@@ -420,13 +481,19 @@ class ImportEngine:
         filename: str = "",
         preserve_raw: bool = False,
         resume: bool = False,
+        profile: str = "shared",
+        profiles: list[str] = None,
     ) -> dict:
         """
         Start or resume an import.
+        profile  — read-side profile used when searching for merge candidates.
+        profiles — write-side ownership for new/raw buckets (default: [profile]).
         开始或恢复导入。
         """
         if self._running:
             return {"error": "Import already running"}
+
+        resolved_profiles: list[str] = profiles or ([profile] if profile else ["shared"])
 
         self._running = True
         self._paused = False
@@ -443,7 +510,7 @@ class ImportEngine:
                     self._chunks = chunk_turns(turns)
                     self.state.data["status"] = "running"
                     self.state.save()
-                    return await self._process_chunks(preserve_raw)
+                    return await self._process_chunks(preserve_raw, profile, resolved_profiles)
                 else:
                     logger.warning("Source file changed, starting fresh import")
 
@@ -462,7 +529,7 @@ class ImportEngine:
             self.state.save()
 
             logger.info(f"Starting import: {len(turns)} turns → {len(self._chunks)} chunks")
-            return await self._process_chunks(preserve_raw)
+            return await self._process_chunks(preserve_raw, profile, resolved_profiles)
 
         except Exception as e:
             self.state.data["status"] = "error"
@@ -471,8 +538,15 @@ class ImportEngine:
             self._running = False
             raise
 
-    async def _process_chunks(self, preserve_raw: bool) -> dict:
+    async def _process_chunks(
+        self,
+        preserve_raw: bool,
+        profile: str = "shared",
+        profiles: list[str] = None,
+    ) -> dict:
         """Process chunks from current position."""
+        if profiles is None:
+            profiles = [profile] if profile else ["shared"]
         start_idx = self.state.data["processed"]
 
         for i in range(start_idx, len(self._chunks)):
@@ -485,7 +559,7 @@ class ImportEngine:
 
             chunk = self._chunks[i]
             try:
-                await self._process_single_chunk(chunk, preserve_raw)
+                await self._process_single_chunk(chunk, preserve_raw, profile, profiles)
             except Exception as e:
                 err_msg = f"Chunk {i}: {str(e)[:200]}"
                 logger.warning(f"Import chunk error: {err_msg}")
@@ -502,10 +576,20 @@ class ImportEngine:
         logger.info(f"Import completed: {self.state.data['memories_created']} created, {self.state.data['memories_merged']} merged")
         return self.state.to_dict()
 
-    async def _process_single_chunk(self, chunk: dict, preserve_raw: bool):
+    async def _process_single_chunk(
+        self,
+        chunk: dict,
+        preserve_raw: bool,
+        profile: str = "shared",
+        profiles: list[str] = None,
+    ):
         """Extract memories from a single chunk and store them."""
+        if profiles is None:
+            profiles = [profile] if profile else ["shared"]
+
         content = chunk["content"]
         if not content.strip():
+            self.state.data["memories_skipped"] += 1
             return
 
         # --- LLM extraction ---
@@ -515,26 +599,32 @@ class ImportEngine:
         except Exception as e:
             logger.warning(f"LLM extraction failed: {e}")
             self.state.data["api_calls"] += 1
+            self.state.data["errors"].append(f"extraction: {str(e)[:100]}")
             return
 
         if not items:
+            self.state.data["memories_skipped"] += 1
             return
 
         # --- Store each extracted memory ---
         for item in items:
             try:
                 should_preserve = preserve_raw or item.get("preserve_raw", False)
+                is_core = _is_identity_or_core(item)
 
                 if should_preserve:
-                    # Raw mode: store original content without summarization
+                    # Raw mode: store original content without summarization.
+                    # Apply core/identity protection: protected=True, importance=10.
                     bucket_id = await self.bucket_mgr.create(
                         content=item["content"],
                         tags=item.get("tags", []),
-                        importance=item.get("importance", 5),
+                        importance=10 if is_core else item.get("importance", 5),
                         domain=item.get("domain", ["未分类"]),
                         valence=item.get("valence", 0.5),
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
+                        protected=is_core,
+                        profiles=profiles,
                     )
                     if self.embedding_engine:
                         try:
@@ -543,21 +633,30 @@ class ImportEngine:
                             pass
                     self.state.data["memories_raw"] += 1
                     self.state.data["memories_created"] += 1
+                    self.state.data["memories_new"] += 1
                 else:
-                    # Normal mode: go through merge-or-create pipeline
-                    is_merged = await self._merge_or_create_item(item)
-                    if is_merged:
+                    # Normal mode: go through merge-or-create pipeline.
+                    # Returns: 'new' | 'merged' | 'merge_candidate' | 'skipped' | 'error'
+                    result = await self._merge_or_create_item(item, profile=profile, profiles=profiles)
+                    if result == "merged":
                         self.state.data["memories_merged"] += 1
-                    else:
+                    elif result == "merge_candidate":
+                        # Created as new but a similar bucket existed that was blocked
                         self.state.data["memories_created"] += 1
-
-                # Patch timestamp if available
-                if chunk.get("timestamp_start"):
-                    # We don't have update support for created, so skip
-                    pass
+                        self.state.data["memories_new"] += 1
+                        self.state.data["memories_merge_candidate"] += 1
+                    elif result == "new":
+                        self.state.data["memories_created"] += 1
+                        self.state.data["memories_new"] += 1
+                    elif result == "skipped":
+                        self.state.data["memories_skipped"] += 1
+                    elif result == "error":
+                        self.state.data["errors"].append(f"store: {item.get('name', '?')}")
 
             except Exception as e:
-                logger.warning(f"Failed to store memory: {item.get('name', '?')}: {e}")
+                err_msg = f"store {item.get('name', '?')}: {str(e)[:100]}"
+                logger.warning(f"Failed to store memory: {err_msg}")
+                self.state.data["errors"].append(err_msg)
 
     async def _extract_memories(self, chunk_content: str) -> list[dict]:
         """Use LLM to extract memories from a conversation chunk."""
@@ -626,8 +725,25 @@ class ImportEngine:
 
         return validated
 
-    async def _merge_or_create_item(self, item: dict) -> bool:
-        """Try to merge with existing bucket, or create new. Returns is_merged."""
+    async def _merge_or_create_item(
+        self,
+        item: dict,
+        profile: str = "shared",
+        profiles: list[str] = None,
+    ) -> str:
+        """Try to merge with existing bucket, or create new.
+
+        Returns one of:
+          'merged'           — successfully merged into an existing bucket
+          'new'              — created as a fresh bucket
+          'merge_candidate'  — similar bucket found but blocked (core/identity/cross-profile/protected);
+                               item was written as a new bucket and flagged in state
+          'skipped'          — nothing to store
+          'error'            — creation failed
+        """
+        if profiles is None:
+            profiles = [profile] if profile else ["shared"]
+
         content = item["content"]
         domain = item.get("domain", ["未分类"])
         tags = item.get("tags", [])
@@ -635,57 +751,84 @@ class ImportEngine:
         valence = item.get("valence", 0.5)
         arousal = item.get("arousal", 0.3)
         name = item.get("name", "")
+        is_core = _is_identity_or_core(item)
 
         try:
-            existing = await self.bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+            existing = await self.bucket_mgr.search(
+                content, limit=1, domain_filter=domain or None, profile=profile
+            )
         except Exception:
             existing = []
 
         merge_threshold = self.config.get("merge_threshold", 75)
+        blocked_merge = False  # True when a candidate exists but is off-limits
 
         if existing and existing[0].get("score", 0) > merge_threshold:
             bucket = existing[0]
-            if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                try:
-                    merged = await self.dehydrator.merge(bucket["content"], content)
-                    self.state.data["api_calls"] += 1
-                    old_v = bucket["metadata"].get("valence", 0.5)
-                    old_a = bucket["metadata"].get("arousal", 0.3)
-                    await self.bucket_mgr.update(
-                        bucket["id"],
-                        content=merged,
-                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                        importance=max(bucket["metadata"].get("importance", 5), importance),
-                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                        valence=round((old_v + valence) / 2, 2),
-                        arousal=round((old_a + arousal) / 2, 2),
-                    )
-                    if self.embedding_engine:
-                        try:
-                            await self.embedding_engine.generate_and_store(bucket["id"], merged)
-                        except Exception:
-                            pass
-                    return True
-                except Exception as e:
-                    logger.warning(f"Merge failed during import: {e}")
-                    self.state.data["api_calls"] += 1
+            meta = bucket["metadata"]
 
-        # Create new
-        bucket_id = await self.bucket_mgr.create(
-            content=content,
-            tags=tags,
-            importance=importance,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            name=name or None,
-        )
-        if self.embedding_engine:
-            try:
-                await self.embedding_engine.generate_and_store(bucket_id, content)
-            except Exception:
-                pass
-        return False
+            # Protection 1: never merge into pinned/protected/permanent buckets
+            if meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent":
+                blocked_merge = True
+            else:
+                # Protection 2: profiles must overlap — no cc↔cx cross-merge
+                src_profiles = set(meta.get("profiles") or ["shared"])
+                tgt_profiles = set(profiles)
+                if not (src_profiles & tgt_profiles):
+                    blocked_merge = False  # just create new, not even a candidate
+                else:
+                    # Protection 3: identity/core items — flag but don't auto-merge
+                    if is_core:
+                        blocked_merge = True
+                    else:
+                        try:
+                            merged = await self.dehydrator.merge(bucket["content"], content)
+                            self.state.data["api_calls"] += 1
+                            old_v = meta.get("valence", 0.5)
+                            old_a = meta.get("arousal", 0.3)
+                            await self.bucket_mgr.update(
+                                bucket["id"],
+                                content=merged,
+                                tags=list(set(meta.get("tags", []) + tags)),
+                                importance=max(meta.get("importance", 5), importance),
+                                domain=list(set(meta.get("domain", []) + domain)),
+                                valence=round((old_v + valence) / 2, 2),
+                                arousal=round((old_a + arousal) / 2, 2),
+                            )
+                            if self.embedding_engine:
+                                try:
+                                    await self.embedding_engine.generate_and_store(bucket["id"], merged)
+                                except Exception:
+                                    pass
+                            return "merged"
+                        except Exception as e:
+                            logger.warning(f"Merge failed during import: {e}")
+                            self.state.data["api_calls"] += 1
+                            # fall through to create new
+
+        # Create new bucket.
+        # Core/identity buckets get protected=True and importance=10.
+        try:
+            bucket_id = await self.bucket_mgr.create(
+                content=content,
+                tags=tags,
+                importance=10 if is_core else importance,
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                name=name or None,
+                protected=is_core,
+                profiles=profiles,
+            )
+            if self.embedding_engine:
+                try:
+                    await self.embedding_engine.generate_and_store(bucket_id, content)
+                except Exception:
+                    pass
+            return "merge_candidate" if blocked_merge else "new"
+        except Exception as e:
+            logger.warning(f"Create failed during import: {e}")
+            return "error"
 
     async def detect_patterns(self) -> list[dict]:
         """
